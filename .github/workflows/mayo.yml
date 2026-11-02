@@ -1,0 +1,95 @@
+name: Mayo Terrace tour watch
+
+on:
+  schedule:
+    - cron: "3,18,33,48 * * * *" # avoids :00
+  workflow_dispatch:
+    inputs:
+      dates:
+        description: "Test only: comma-separated YYYY-MM-DD (blank = 30 Nov - 4 Dec)"
+        required: false
+        default: ""
+      people:
+        description: "Test only: places needed (blank = 2)"
+        required: false
+        default: ""
+      any_tour:
+        description: "Test only: also include Japanese tours"
+        required: false
+        type: boolean
+        default: false
+
+concurrency:
+  group: mayo-watch
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  # After the last watched date, turn the schedule off so it stops for good.
+  window:
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    permissions:
+      actions: write
+    outputs:
+      open: ${{ steps.check.outputs.open }}
+    steps:
+      - id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+          LAST_DATE: "2026-12-04"
+        run: |
+          today="$(TZ=Asia/Tokyo date +%F)"
+          if [[ "$today" > "$LAST_DATE" ]]; then
+            echo "Past $LAST_DATE (today is $today JST): disabling this workflow."
+            gh workflow disable mayo.yml --repo "$GITHUB_REPOSITORY"
+            echo "open=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "open=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  check:
+    needs: window
+    if: needs.window.outputs.open == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - run: pip install -r requirements.txt
+
+      - run: python -m playwright install --with-deps chromium
+
+      - name: Restore state.json
+        uses: actions/cache/restore@v6
+        with:
+          path: state.json
+          key: mayo-state-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: mayo-state-
+
+      - name: Check tours once
+        env:
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+          TEST_DATES: ${{ inputs.dates }}
+          TEST_PEOPLE: ${{ inputs.people }}
+          TEST_ANY_TOUR: ${{ inputs.any_tour }}
+        run: |
+          args=(--once)
+          if [ -n "$TEST_DATES" ]; then args+=(--dates "$TEST_DATES"); fi
+          if [ -n "$TEST_PEOPLE" ]; then args+=(--people "$TEST_PEOPLE"); fi
+          if [ "$TEST_ANY_TOUR" = "true" ]; then args+=(--any-tour); fi
+          python mayo_watch.py "${args[@]}"
+
+      - name: Save state.json
+        if: always()
+        uses: actions/cache/save@v6
+        with:
+          path: state.json
+          key: mayo-state-${{ github.run_id }}-${{ github.run_attempt }}
