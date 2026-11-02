@@ -2,7 +2,7 @@ name: Mayo Terrace tour watch
 
 on:
   schedule:
-    - cron: "3,18,33,48 * * * *" # avoids :00
+    - cron: "3,18,33,48 * * * *" # every 15 minutes, offset to avoid :00
   workflow_dispatch:
     inputs:
       dates:
