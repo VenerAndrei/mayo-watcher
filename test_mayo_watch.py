@@ -278,6 +278,9 @@ class Booking(unittest.TestCase):
         booker, _ = w.booker_from_env({"BOOK_LAST_NAME": "D", "BOOK_FIRST_NAME": "A",
                                        "BOOK_PHONE": "090-1234 5678", "BOOK_EMAIL": "a@b.c"})
         self.assertEqual(booker.phone, "09012345678")
+        booker, _ = w.booker_from_env({"BOOK_LAST_NAME": "D", "BOOK_FIRST_NAME": "A",
+                                       "BOOK_PHONE": "+40 700-000-000", "BOOK_EMAIL": "a@b.c"})
+        self.assertEqual(booker.phone, "0040700000000")
 
     def test_book_flag_refuses_to_run_without_details(self):
         with mock.patch.dict("os.environ", {}, clear=True), mock.patch.object(w, "run_once") as run:

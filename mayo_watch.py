@@ -261,7 +261,8 @@ def booker_from_env(environ=os.environ) -> tuple[Booker | None, list[str]]:
     missing = [BOOKER_VARIABLES[key] for key, value in values.items() if not value]
     if missing:
         return None, missing
-    values["phone"] = re.sub(r"[\s()\-]", "", values["phone"])
+    # The site accepts digits only, so +40... has to be written as 0040...
+    values["phone"] = re.sub(r"[\s()\-]", "", values["phone"]).replace("+", "00", 1)
     return Booker(country=environ.get("BOOK_COUNTRY", "").strip(), **values), []
 
 
