@@ -284,7 +284,8 @@ def close_dialogs(page) -> None:
 
 
 def page_errors(page) -> list[str]:
-    return page.locator(".error-message:visible, .message.error:visible, .is-error:visible").all_inner_texts()
+    found = page.locator('[class*="error" i]:visible').all_inner_texts()
+    return [text.strip() for text in found if text.strip()]
 
 
 def fill_booking_form(page, slot: Slot, people: int, booker: Booker) -> None:
@@ -380,7 +381,12 @@ def rehearse(dates: set[str], people: int, any_tour: bool, booker: Booker, show:
     print(f"Rehearsal on {describe(slot)}. The final button will not be pressed.")
     try:
         with open_page(show) as page:
-            fill_booking_form(page, slot, people, booker)
+            try:
+                fill_booking_form(page, slot, people, booker)
+            except BookingFailed:
+                # Shows which field the site objected to if the message wasn't recognised.
+                print(booker.scrub(page.locator("body").inner_text())[:6000])
+                raise
             print(f"Reached the confirmation page: {page.url}")
             buttons = page.locator('form button:visible, form input[type="submit"]:visible')
             for button in buttons.all():
