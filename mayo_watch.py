@@ -47,7 +47,7 @@ BOOK_TIMEOUT_MS = 30_000
 VENUE_PHONE = "03-5384-7770"
 TO_CONFIRM_BUTTON = "内容確認へ進む"
 # The confirmation page's final button. Only ever clicked when it is the single match.
-FINAL_BUTTON = re.compile(r"予約|確定|登録|完了")
+FINAL_BUTTON = re.compile(r"予約を登録する")
 BOOKER_VARIABLES = {"last_name": "BOOK_LAST_NAME", "first_name": "BOOK_FIRST_NAME",
                     "phone": "BOOK_PHONE", "email": "BOOK_EMAIL"}
 

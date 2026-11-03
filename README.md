@@ -1,10 +1,13 @@
 # Mayo Terrace tour watcher
 
-Checks the Kewpie Mayo Terrace (Tokyo) calendar every 15 minutes and sends a push notification to your phone when an English tour has places for 2 people. **It only reads and notifies. It never books.** You book by hand from the link in the alert.
+Checks the Kewpie Mayo Terrace (Tokyo) calendar every 15 minutes. When an English tour has places for 2 people, **it books the earliest one for 2 adults, once, without asking you, then turns itself off** and sends a push notification to your phone.
+
+Cancelling or changing a booking is by phone only: 03-5384-7770. **If you book a tour yourself, turn the watcher off first** (see [Stopping early](#stopping-early)), or it may book a second one.
 
 - **Dates:** 30 Nov – 4 Dec 2026
 - **Tours:** rows with "English" in the title (`--any-tour` adds the Japanese ones)
-- **Stops:** by itself after 4 Dec 2026 (Japan time); the workflow then disables its own schedule
+- **Stops:** after one booking, or by itself after 4 Dec 2026 (Japan time); the workflow then disables its own schedule
+- **Triggered by:** a cron-job.org job, because GitHub's schedule wasn't firing. These runs show as `workflow_dispatch`. Pause that job after a booking, or it will report failures against the disabled workflow.
 
 An alert looks like this:
 
@@ -51,7 +54,7 @@ gh run watch
 
 To test the normal watch instead, run `gh workflow run mayo.yml` with no inputs; it stays silent unless an English tour has places. Each run's log lists the status of every watched slot, so you can check the site is being read correctly.
 
-The schedule then runs by itself, with your laptop off. GitHub can start scheduled runs some minutes late.
+It then keeps running with your laptop off.
 
 ## Running locally
 
@@ -83,10 +86,28 @@ python mayo_watch.py --once --people 1 --any-tour
 | `--state-file` | Where to keep alert history. Default: `state.json`. |
 | `--dry-run` | Print what would be alerted. Sends nothing and saves nothing. |
 | `--show` | Use a visible browser, for debugging. |
+| `--book` | Book the earliest hit, once. Needs the `BOOK_*` variables. |
+| `--rehearse` | Hold real places and stop at the confirmation page. Never books. |
 
 If `NTFY_TOPIC` isn't set locally, the script behaves as `--dry-run`. On GitHub a missing secret fails the run.
 
 Offline tests: `python -m unittest test_mayo_watch`
+
+## Booking rules
+
+- Your details come from the secrets `BOOK_LAST_NAME`, `BOOK_FIRST_NAME`, `BOOK_PHONE`, `BOOK_EMAIL` and the optional `BOOK_COUNTRY`, set with `gh secret set`. The run logs are public, so the script keeps these out of them. The site accepts digits only for the phone, so `+40...` is sent as `0040...`.
+- By booking, the script accepts the tour's Terms of Agreement and the site's privacy policy for you.
+- Only a normal run with no inputs books. A run with `dates`, `people` or `any_tour` set only alerts.
+- A tour starting within 3 hours isn't booked, only alerted.
+- If a slot's places are gone by the time it tries, it moves on to the next slot.
+- If the form fails, you get an alert to book by hand, and it tries again at the next check. After 2 failures it goes back to alerts only, because each attempt can hold real places for 30 minutes.
+- The booking is recorded and the workflow told to disable itself just before the final button is pressed, so it can't book twice. If success can't be confirmed, it still stops, and the alert asks you to check your email.
+
+To test the form without booking, run a rehearsal on dates with spare places. It holds real places for up to 30 minutes and stops at the confirmation page:
+
+```sh
+gh workflow run mayo.yml -f rehearse=true -f dates=YYYY-MM-DD
+```
 
 ## Alert rules
 

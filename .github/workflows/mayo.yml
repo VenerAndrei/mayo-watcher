@@ -106,6 +106,9 @@ jobs:
               exit 1
             fi
             args+=(--rehearse)
+          elif [ -z "$TEST_DATES$TEST_PEOPLE" ] && [ "$TEST_ANY_TOUR" != "true" ]; then
+            # Only a normal run books. Any test input means alerts only.
+            args+=(--book)
           fi
           python mayo_watch.py "${args[@]}"
 
