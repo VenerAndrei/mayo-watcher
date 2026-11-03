@@ -18,6 +18,11 @@ on:
         required: false
         type: boolean
         default: false
+      rehearse:
+        description: "Hold real places on the given dates and stop at the confirmation page. Never books."
+        required: false
+        type: boolean
+        default: false
 
 concurrency:
   group: mayo-watch
@@ -55,6 +60,9 @@ jobs:
     if: needs.window.outputs.open == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    permissions:
+      contents: read
+      actions: write # lets the job disable the workflow straight after a booking
     steps:
       - uses: actions/checkout@v7
 
@@ -75,8 +83,15 @@ jobs:
           restore-keys: mayo-state-
 
       - name: Check tours once
+        id: check
         env:
           NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+          BOOK_LAST_NAME: ${{ secrets.BOOK_LAST_NAME }}
+          BOOK_FIRST_NAME: ${{ secrets.BOOK_FIRST_NAME }}
+          BOOK_PHONE: ${{ secrets.BOOK_PHONE }}
+          BOOK_EMAIL: ${{ secrets.BOOK_EMAIL }}
+          BOOK_COUNTRY: ${{ secrets.BOOK_COUNTRY }}
+          TEST_REHEARSE: ${{ inputs.rehearse }}
           TEST_DATES: ${{ inputs.dates }}
           TEST_PEOPLE: ${{ inputs.people }}
           TEST_ANY_TOUR: ${{ inputs.any_tour }}
@@ -85,6 +100,13 @@ jobs:
           if [ -n "$TEST_DATES" ]; then args+=(--dates "$TEST_DATES"); fi
           if [ -n "$TEST_PEOPLE" ]; then args+=(--people "$TEST_PEOPLE"); fi
           if [ "$TEST_ANY_TOUR" = "true" ]; then args+=(--any-tour); fi
+          if [ "$TEST_REHEARSE" = "true" ]; then
+            if [ -z "$TEST_DATES" ]; then
+              echo "A rehearsal needs dates outside the watched ones."
+              exit 1
+            fi
+            args+=(--rehearse)
+          fi
           python mayo_watch.py "${args[@]}"
 
       - name: Save state.json
@@ -93,3 +115,11 @@ jobs:
         with:
           path: state.json
           key: mayo-state-${{ github.run_id }}-${{ github.run_attempt }}
+
+      # Disabled as soon as the final button may have been pressed, so that the
+      # next run can't book again even if state.json is lost.
+      - name: Stop after booking
+        if: always() && steps.check.outputs.stop == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow disable mayo.yml --repo "$GITHUB_REPOSITORY"

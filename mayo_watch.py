@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Tour-slot watcher for Kewpie Mayo Terrace (Tokyo).
 
-Read-only: it loads the public calendar and sends push notifications. It never
-opens a slot's booking link; that link is only passed along in the alert.
+Loads the public calendar and sends push notifications. With --book it also
+reserves the earliest suitable tour with the details from the BOOK_* environment
+variables, once, and then stops. Without --book it never opens a booking link.
 """
 from __future__ import annotations
 
@@ -15,7 +16,8 @@ import sys
 import time
 import urllib.parse
 import urllib.request
-from dataclasses import dataclass
+from contextlib import contextmanager
+from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
@@ -38,6 +40,16 @@ GOTO_TIMEOUT_MS = 60_000
 SELECTOR_TIMEOUT_MS = 30_000
 WEEK_CHANGE_TIMEOUT_MS = 20_000
 READ_RETRY_SECONDS = 15
+
+BOOK_MIN_LEAD = timedelta(hours=3)  # don't book a tour nobody could reach in time
+MAX_BOOKING_FAILURES = 2  # each failed attempt can tie up real places for 30 minutes
+BOOK_TIMEOUT_MS = 30_000
+VENUE_PHONE = "03-5384-7770"
+TO_CONFIRM_BUTTON = "内容確認へ進む"
+# The confirmation page's final button. Only ever clicked when it is the single match.
+FINAL_BUTTON = re.compile(r"予約|確定|登録|完了")
+BOOKER_VARIABLES = {"last_name": "BOOK_LAST_NAME", "first_name": "BOOK_FIRST_NAME",
+                    "phone": "BOOK_PHONE", "email": "BOOK_EMAIL"}
 
 PLACES_LEFT = re.compile(r"残り\s*(\d+)\s*人")
 # Everything here means "not bookable". Other text is logged in case the site's
@@ -86,6 +98,30 @@ class Slot:
     @property
     def is_english(self) -> bool:
         return "english" in self.tour.lower()
+
+
+@dataclass(frozen=True)
+class Booker:
+    # repr=False keeps personal details out of logs: the run logs are public.
+    last_name: str = field(repr=False)
+    first_name: str = field(repr=False)
+    phone: str = field(repr=False)
+    email: str = field(repr=False)
+    country: str = field(repr=False, default="")
+
+    def scrub(self, text: str) -> str:
+        for value in (self.last_name, self.first_name, self.phone, self.email, self.country):
+            if value:
+                text = text.replace(value, "[hidden]")
+        return text
+
+
+class BookingFailed(Exception):
+    """The form could not be completed. The final button was NOT pressed."""
+
+
+class SlotTaken(BookingFailed):
+    """The site refused to hold the places, so someone else got there first."""
 
 
 # ---------------------------------------------------------------- parsing
@@ -184,31 +220,179 @@ def walk_calendar(page, dates: set[str], today: date) -> tuple[list[Slot], str |
         return slots, text
 
 
-def fetch_slots(dates: set[str], today: date, show: bool = False) -> tuple[list[Slot], str | None]:
+@contextmanager
+def open_page(show: bool = False):
     from playwright.sync_api import sync_playwright
+    with sync_playwright() as playwright:
+        browser = playwright.chromium.launch(headless=not show)
+        try:
+            context = browser.new_context(
+                user_agent=USER_AGENT, locale="ja-JP", timezone_id="Asia/Tokyo",
+            )
+            page = context.new_page()
+
+            def filter_requests(route):
+                request = route.request
+                host = urllib.parse.urlsplit(request.url).hostname or ""
+                if ALLOWED_HOST.search(host) and request.resource_type not in BLOCKED_RESOURCES:
+                    route.continue_()
+                else:
+                    route.abort()
+
+            page.route("**/*", filter_requests)
+            yield page
+        finally:
+            browser.close()
+
+
+def fetch_slots(dates: set[str], today: date, show: bool = False) -> tuple[list[Slot], str | None]:
     try:
-        with sync_playwright() as playwright:
-            browser = playwright.chromium.launch(headless=not show)
-            try:
-                context = browser.new_context(
-                    user_agent=USER_AGENT, locale="ja-JP", timezone_id="Asia/Tokyo",
-                )
-                page = context.new_page()
-
-                def filter_requests(route):
-                    request = route.request
-                    host = urllib.parse.urlsplit(request.url).hostname or ""
-                    if ALLOWED_HOST.search(host) and request.resource_type not in BLOCKED_RESOURCES:
-                        route.continue_()
-                    else:
-                        route.abort()
-
-                page.route("**/*", filter_requests)
-                return walk_calendar(page, dates, today)
-            finally:
-                browser.close()
+        with open_page(show) as page:
+            return walk_calendar(page, dates, today)
     except Exception as exc:
         return [], f"browser error: {exc}"
+
+
+# ---------------------------------------------------------------- booking
+
+def booker_from_env(environ=os.environ) -> tuple[Booker | None, list[str]]:
+    """Returns the booker, or None plus the names of the missing variables."""
+    values = {key: environ.get(name, "").strip() for key, name in BOOKER_VARIABLES.items()}
+    missing = [BOOKER_VARIABLES[key] for key, value in values.items() if not value]
+    if missing:
+        return None, missing
+    values["phone"] = re.sub(r"[\s()\-]", "", values["phone"])
+    return Booker(country=environ.get("BOOK_COUNTRY", "").strip(), **values), []
+
+
+def bookable(hits: list[Slot], now: datetime) -> list[Slot]:
+    """Hits that start far enough ahead to be reached, earliest first."""
+    def starts(slot: Slot) -> datetime:
+        return datetime.strptime(slot.timestamp, "%Y/%m/%d %H:%M").replace(tzinfo=JST)
+    return sorted((h for h in hits if starts(h) - now >= BOOK_MIN_LEAD), key=starts)
+
+
+def click_in_page(locator) -> None:
+    """The site hides its radios and checkboxes behind styled labels."""
+    locator.evaluate("e => e.click()")
+
+
+def close_dialogs(page) -> None:
+    buttons = page.locator(".ui-dialog .js_temp_dialog_close:visible")
+    while buttons.count():
+        buttons.first.click()
+
+
+def page_errors(page) -> list[str]:
+    return page.locator(".error-message:visible, .message.error:visible, .is-error:visible").all_inner_texts()
+
+
+def fill_booking_form(page, slot: Slot, people: int, booker: Booker) -> None:
+    """Hold the places, fill the form and go on to the confirmation page."""
+    page.set_default_timeout(BOOK_TIMEOUT_MS)
+    page.goto(slot.url, wait_until="domcontentloaded", timeout=GOTO_TIMEOUT_MS)
+    form = page.locator("form.js_reservation_form")
+    form.wait_for()
+    text = form.inner_text()
+    if slot.timestamp[:10] not in text or slot.tour not in text:
+        raise BookingFailed("the form is not for the expected tour and date")
+    if "Adults" not in text:
+        raise BookingFailed("the form has no Adults row")
+
+    form.locator('select[name="reservations[number]"]').select_option(str(people))
+    with page.expect_response(lambda r: "tempReservationNumber" in r.url) as held:
+        form.locator(".js_temp_reservation_number").click()
+    if not held.value.ok:
+        raise SlotTaken(f"the site would not hold {people} places")
+    page.wait_for_selector(".ui-dialog .js_temp_dialog_close")
+    close_dialogs(page)
+
+    form.locator('select[name$="[reservation_options][1][number]"]').select_option(str(people))
+    radios = form.locator('input[type="radio"][name^="reservations[addition_values]"]')
+    for index in range(radios.count()):
+        radio = radios.nth(index)
+        label = form.locator(f'label[for="{radio.get_attribute("id")}"]').inner_text()
+        if "Terms of Agreement" not in label:
+            raise BookingFailed(f"unexpected choice on the form: {label!r}")
+        click_in_page(radio)
+    if not radios.count():
+        raise BookingFailed("the Terms of Agreement choice is missing")
+
+    form.locator('input[name="users[addition_values][22][0]"]').fill(booker.last_name)
+    form.locator('input[name="users[addition_values][22][1]"]').fill(booker.first_name)
+    form.locator('input[name="users[addition_values][23]"]').fill(booker.phone)
+    form.locator('input[name="users[mail]"]').fill(booker.email)
+    form.locator('input[name="users[mail_confirm]"]').fill(booker.email)
+    if booker.country:
+        form.locator('tr:has-text("Country of Residence") input[type="text"]').fill(booker.country)
+    click_in_page(form.locator('input[type="checkbox"][name="privacy_policy"]'))
+
+    with page.expect_navigation(wait_until="domcontentloaded"):
+        form.locator(f'button[type="submit"]:has-text("{TO_CONFIRM_BUTTON}")').click()
+    if page.locator('input[type="text"][name="users[mail]"]').count():
+        raise BookingFailed(f"the form was rejected: {page_errors(page) or 'no message shown'}")
+
+
+def final_buttons(page):
+    buttons = page.locator('form button[type="submit"]:visible, form input[type="submit"]:visible')
+    return [b for b in buttons.all()
+            if FINAL_BUTTON.search(b.inner_text() or b.get_attribute("value") or "")]
+
+
+def book_slot(slot: Slot, people: int, booker: Booker, before_submit, show: bool = False) -> bool:
+    """Book one slot. Raises BookingFailed if the final button was not pressed.
+
+    Once before_submit() has run the outcome is final as far as the caller is
+    concerned: returns True if the site showed success, False if it can't be told.
+    """
+    try:
+        with open_page(show) as page:
+            fill_booking_form(page, slot, people, booker)
+            found = final_buttons(page)
+            if len(found) != 1:
+                raise BookingFailed(f"expected one final button, found {len(found)}")
+            before_submit()
+            try:
+                with page.expect_navigation(wait_until="domcontentloaded", timeout=GOTO_TIMEOUT_MS):
+                    found[0].click()
+                return not final_buttons(page) and not page_errors(page)
+            except Exception as exc:
+                print(f"After pressing the final button: {booker.scrub(str(exc).splitlines()[0])}")
+                return False
+    except SlotTaken:
+        raise
+    except BookingFailed as exc:
+        raise BookingFailed(booker.scrub(str(exc))) from None
+    except Exception as exc:
+        first = str(exc).splitlines()[0] if str(exc) else type(exc).__name__
+        raise BookingFailed(booker.scrub(first)) from None
+
+
+def rehearse(dates: set[str], people: int, any_tour: bool, booker: Booker, show: bool = False) -> int:
+    """Go as far as the confirmation page and stop. Real places are held for 30 minutes."""
+    today = datetime.now(JST).date()
+    fetched, error = fetch_slots(dates, today, show)
+    hits = bookable(find_hits(select_slots(fetched, dates, any_tour), people), datetime.now(timezone.utc))
+    if not hits:
+        print(f"Rehearsal: no slot has {people} places on those dates ({error or 'no error'}). Nothing held.")
+        return 1
+    slot = hits[0]
+    print(f"Rehearsal on {describe(slot)}. The final button will not be pressed.")
+    try:
+        with open_page(show) as page:
+            fill_booking_form(page, slot, people, booker)
+            print(f"Reached the confirmation page: {page.url}")
+            buttons = page.locator('form button:visible, form input[type="submit"]:visible')
+            for button in buttons.all():
+                label = button.inner_text() or button.get_attribute("value") or ""
+                print(f"  button {button.get_attribute('type')}: {booker.scrub(label)!r}")
+            print(f"  would press: {[b.inner_text() or b.get_attribute('value') for b in final_buttons(page)]}")
+            print(booker.scrub(page.locator("body").inner_text())[:3000])
+    except Exception as exc:
+        print(f"REHEARSAL FAILED: {booker.scrub(str(exc).splitlines()[0])}")
+        return 1
+    print("Rehearsal finished. Nothing was booked; the hold expires by itself within 30 minutes.")
+    return 0
 
 
 # ---------------------------------------------------------------- alerts
@@ -272,6 +456,8 @@ def load_state(path: Path) -> dict:
         "active": state.get("active") or {},  # slot key -> last alert time (UTC ISO)
         "consecutive_failures": state.get("consecutive_failures") or 0,
         "broken_alert_sent": bool(state.get("broken_alert_sent")),
+        "booking": state.get("booking"),  # set just before the final button is pressed
+        "booking_failures": state.get("booking_failures") or 0,
     }
 
 
@@ -296,6 +482,14 @@ def run_url() -> str | None:
     return f"{server}/{repo}/actions/runs/{run}" if server and repo and run else None
 
 
+def request_stop() -> None:
+    """Tell the workflow to disable itself, so a lost state file can't book twice."""
+    path = os.environ.get("GITHUB_OUTPUT")
+    if path:
+        with open(path, "a", encoding="utf-8") as output:
+            output.write("stop=true\n")
+
+
 # ---------------------------------------------------------------- one check
 
 def print_summary(slots: list[Slot]) -> None:
@@ -307,12 +501,64 @@ def print_summary(slots: list[Slot]) -> None:
         print(f"{tour}: {statuses}")
 
 
+def attempt_booking(hits: list[Slot], people: int, booker: Booker, state: dict, state_path: Path,
+                    topic: str | None, send, book, now: datetime) -> int | None:
+    """Try the hits in order. Returns an exit code once a booking was submitted,
+    or None if nothing was, so the normal alerts carry on."""
+    for slot in bookable(hits, now):
+        def before_submit(slot=slot):
+            # Recorded first: if anything dies from here on, it must never retry.
+            state["booking"] = {"slot": slot.key, "at": now.isoformat(), "confirmed": False}
+            save_state(state_path, state)
+            request_stop()
+
+        try:
+            confirmed = book(slot, people, booker, before_submit)
+        except SlotTaken as exc:
+            print(f"Could not book {describe(slot)}: {exc}")
+            continue
+        except BookingFailed as exc:
+            state["booking_failures"] += 1
+            print(f"BOOKING FAILED ({state['booking_failures']}/{MAX_BOOKING_FAILURES}), "
+                  f"nothing was submitted: {exc}")
+            try:
+                note = ("Auto-booking is now off; alerts continue."
+                        if state["booking_failures"] >= MAX_BOOKING_FAILURES else "Will try again next check.")
+                send(topic, f"Mayo Terrace auto-booking failed for {nice_time(slot)}. Book by hand now. "
+                            f"{note} {exc}"[:1000], click=slot.url, tags="warning")
+            except Exception as send_error:
+                print(f"ERROR: could not send booking-failure alert: {send_error}")
+            return None
+
+        state["booking"]["confirmed"] = confirmed
+        save_state(state_path, state)
+        when = f"{people} places, {nice_time(slot)}"
+        message = (f"Booked Mayo Terrace: {when}. Check your email for the confirmation."
+                   if confirmed else
+                   f"Mayo Terrace booking for {when} was submitted, but success couldn't be confirmed. "
+                   f"Check your email. If nothing arrives, call {VENUE_PHONE} or book by hand.")
+        message += f" Watcher stopped. Changes or cancelling: phone {VENUE_PHONE}."
+        print(message)
+        try:
+            send(topic, message, click=slot.url if not confirmed else run_url() or CALENDAR_URL,
+                 tags="tada" if confirmed else "warning")
+        except Exception as exc:
+            print(f"ERROR: could not send booking alert: {exc}")
+            return 1
+        return 0
+    return None
+
+
 def run_once(dates: set[str], people: int, any_tour: bool, state_path: Path, topic: str | None,
              dry_run: bool, show: bool = False, fetch=None, send=send_ntfy,
-             now: datetime | None = None) -> int:
+             now: datetime | None = None, booker: Booker | None = None, book=None) -> int:
     """Run one check. Returns a process exit code."""
     now = now or datetime.now(timezone.utc)
     state = load_state(state_path)
+    if state["booking"]:
+        print(f"Already booked ({state['booking']['slot']}), so doing nothing.")
+        request_stop()
+        return 0
     today = now.astimezone(JST).date()
     fetched, error = fetch(dates, today) if fetch else fetch_slots(dates, today, show)
 
@@ -334,6 +580,17 @@ def run_once(dates: set[str], people: int, any_tour: bool, state_path: Path, top
     print(f"Parsed {len(wanted)} slots. Hits for {people}+ people: {len(hits)}")
     for hit in hits:
         print(f"  {describe(hit)}")
+
+    if booker and hits:
+        if dry_run:
+            print(f"[dry run] would book: {[describe(h) for h in bookable(hits, now)]}")
+        elif state["booking_failures"] >= MAX_BOOKING_FAILURES:
+            print("Auto-booking is off after repeated failures; alerting only.")
+        else:
+            attempt = book or (lambda s, p, b, before: book_slot(s, p, b, before, show))
+            code = attempt_booking(hits, people, booker, state, state_path, topic, send, attempt, now)
+            if code is not None:
+                return code
 
     exit_code = 0
 
@@ -415,7 +672,7 @@ def positive_int(text: str) -> int:
 def main(argv=None) -> int:
     if hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(encoding="utf-8", errors="replace", line_buffering=True)
-    parser = argparse.ArgumentParser(description="Kewpie Mayo Terrace tour watcher (never books).")
+    parser = argparse.ArgumentParser(description="Kewpie Mayo Terrace tour watcher and auto-booker.")
     parser.add_argument("--once", action="store_true", help="check once and exit")
     parser.add_argument("--interval", type=positive_int, default=DEFAULT_INTERVAL, metavar="SECONDS",
                         help=f"seconds between checks in loop mode (default: {DEFAULT_INTERVAL})")
@@ -426,7 +683,22 @@ def main(argv=None) -> int:
     parser.add_argument("--state-file", type=Path, default=Path("state.json"))
     parser.add_argument("--dry-run", action="store_true", help="print what would be alerted; send and save nothing")
     parser.add_argument("--show", action="store_true", help="use a visible browser, for debugging")
+    parser.add_argument("--book", action="store_true",
+                        help="book the earliest hit, once, using the BOOK_* environment variables")
+    parser.add_argument("--rehearse", action="store_true",
+                        help="hold real places and stop at the confirmation page; never books")
     args = parser.parse_args(argv)
+    if args.book and args.rehearse:
+        parser.error("--book and --rehearse can't be combined")
+
+    booker = None
+    if args.book or args.rehearse:
+        booker, missing = booker_from_env()
+        if not booker:
+            print(f"ERROR: these need setting for booking: {', '.join(missing)}")
+            return 2
+    if args.rehearse:
+        return rehearse(set(args.dates), args.people, args.any_tour, booker, args.show)
 
     topic = os.environ.get("NTFY_TOPIC", "").strip() or None
     dry_run = args.dry_run
@@ -443,8 +715,9 @@ def main(argv=None) -> int:
             print(f"Last watched date {max(args.dates)} has passed (today is {today} JST). Stopping.")
             return 0
         dates = {d for d in args.dates if d >= today}
-        code = run_once(dates, args.people, args.any_tour, args.state_file, topic, dry_run, args.show)
-        if args.once:
+        code = run_once(dates, args.people, args.any_tour, args.state_file, topic, dry_run, args.show,
+                        booker=booker)
+        if args.once or load_state(args.state_file)["booking"]:
             return code
         time.sleep(args.interval)
 
